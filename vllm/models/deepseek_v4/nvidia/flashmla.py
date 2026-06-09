@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
+_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS = 8192
 _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK = 256
 _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK = 1152
 
@@ -73,8 +74,7 @@ def _use_indexed_d512_split_prefill(
         and head_dim == 512
         and num_prefills == 1
         and _is_indexed_d512_split_topk(combined_topk)
-        and max_prefill_seq_len
-        >= envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
+        and max_prefill_seq_len >= _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
     )
 
 
@@ -83,28 +83,6 @@ def _is_indexed_d512_split_topk(combined_topk: int) -> bool:
         _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK
         <= combined_topk
         <= _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
-    )
-
-
-def _use_indexed_d512_chunked_prefill(
-    *,
-    compress_ratio: int,
-    head_dim: int,
-    num_prefills: int,
-    combined_topk: int,
-    max_prefill_seq_len: int,
-    swa_only: bool,
-) -> bool:
-    return (
-        envs.VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL
-        and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
-        and not swa_only
-        and compress_ratio in (4, 128)
-        and head_dim == 512
-        and num_prefills == 1
-        and combined_topk > _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
-        and max_prefill_seq_len
-        >= envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
     )
 
 
@@ -678,9 +656,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             and layer.compress_ratio in (4, 128)
             and q.shape[-1] == 512
             and kv.shape[0] == 1
-            and 512
-            < combined_indices.shape[-1]
-            <= _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
+            and _is_indexed_d512_split_topk(combined_indices.shape[-1])
             and len(state_buffers) == 4
         ):
             indexed_d512_scores = state_buffers[3]
