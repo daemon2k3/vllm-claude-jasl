@@ -30,6 +30,76 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
+_INDEXED_D512_SPLIT_PREFILL_MIN_TOPK = 256
+_INDEXED_D512_SPLIT_PREFILL_MAX_TOPK = 1152
+
+
+def _use_indexed_d512_split_prefill(
+    *,
+    compress_ratio: int,
+    head_dim: int,
+    num_prefills: int,
+    combined_topk: int,
+    max_prefill_seq_len: int,
+    swa_only: bool,
+) -> bool:
+    return (
+        envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
+        and not swa_only
+        and compress_ratio in (4, 128)
+        and head_dim == 512
+        and num_prefills == 1
+        and _is_indexed_d512_split_topk(combined_topk)
+        and max_prefill_seq_len
+        >= envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
+    )
+
+
+def _is_indexed_d512_split_topk(combined_topk: int) -> bool:
+    return (
+        _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK
+        <= combined_topk
+        <= _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
+    )
+
+
+def _use_indexed_d512_chunked_prefill(
+    *,
+    compress_ratio: int,
+    head_dim: int,
+    num_prefills: int,
+    combined_topk: int,
+    max_prefill_seq_len: int,
+    swa_only: bool,
+) -> bool:
+    return (
+        envs.VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL
+        and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
+        and not swa_only
+        and compress_ratio in (4, 128)
+        and head_dim == 512
+        and num_prefills == 1
+        and combined_topk > _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
+        and max_prefill_seq_len
+        >= envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
+    )
+
+
+def _sparse_mla_prefill_gather_len_upper_bound(
+    *,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    window_size: int,
+) -> tuple[int, int]:
+    max_query_chunk_tokens = max(1, min(max_model_len, max_num_batched_tokens))
+    max_prefix_len = max(max_model_len - max_query_chunk_tokens, 0)
+    max_gather_len = max_query_chunk_tokens + min(
+        max_prefix_len,
+        max(window_size - 1, 0),
+    )
+    return max_query_chunk_tokens, max_gather_len
+
+
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
