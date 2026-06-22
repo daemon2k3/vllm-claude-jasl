@@ -10,7 +10,6 @@ import torch
 
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -35,7 +34,7 @@ def run_mixed_prefill_decode_warmup(
     req_id_prefix: str = "_v2_mixed_warmup",
 ) -> bool:
     """Run a V2 mixed prefill+decode step through normal scheduler inputs."""
-    if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
+    if model_runner.is_pooling_model or num_tokens < 3:
         return False
 
     decode_req_id = f"{req_id_prefix}_decode_"

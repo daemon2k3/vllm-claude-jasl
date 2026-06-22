@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+FLASHINFER_MLA_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+
 
 class _FlashInferMLASparseBackendBase(AttentionBackend):
     """Common metadata for concrete FlashInfer sparse MLA backends."""
@@ -81,7 +83,7 @@ class FlashInferMLASparseTRTLLMBackend(_FlashInferMLASparseBackendBase):
         return [32, 64]
 
     @staticmethod
-    def get_impl_cls() -> type[MLAAttentionImpl]:
+    def get_impl_cls() -> type[SparseMLAAttentionImpl]:
         return FlashInferMLASparseImpl
 
     @classmethod
@@ -158,7 +160,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         return [64, 256]
 
     @staticmethod
-    def get_impl_cls() -> type[MLAAttentionImpl]:
+    def get_impl_cls() -> type[SparseMLAAttentionImpl]:
         from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
             FlashInferMLASparseSM120Impl,
         )
@@ -428,17 +430,8 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
-        # Single-token sparse decode. trtllm-gen requires the q_len_per_request
-        # dim, but the sparse attention mask is fully per-token (each query token
-        # carries its own top-k index row), so unsqueeze is sufficient and
-        # correct. The MTP/multi-token q_len grouping is a perf-only layout and is
-        # deferred until MTP is validated end-to-end for this backend.
-        query = q.unsqueeze(1)
-        block_tables = topk_indices_physical.unsqueeze(1)
-        seq_lens_arg = seq_lens
-
-        kernel_out = trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
+        o = trtllm_batch_decode_with_kv_cache_mla(
+            query=q.unsqueeze(1),
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,

@@ -196,7 +196,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            alignment=576 if uses_fp8_ds_mla_layout else None,
         )
 
     def forward(self): ...

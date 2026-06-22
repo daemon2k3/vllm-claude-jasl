@@ -95,8 +95,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            alignment=576 if uses_fp8_ds_mla_layout else None,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
         )
@@ -598,6 +597,28 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 block_table,
                 block_table.stride(0),
                 self.block_size,
+                token_offset=0,
+                TRITON_BLOCK_SIZE=1024,
+            )
+
+        # Prefill SWA indices live in paged coordinates. `token_offset` lets
+        # the kernel read is_valid_token / token_to_req_indices at absolute
+        # prefill positions while writing output starting at index 0.
+        if num_prefill_tokens > 0:
+            prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
+            prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
+            _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
+                prefill_swa_indices,
+                prefill_swa_indices.stride(0),
+                prefill_swa_lens,
+                self.window_size,
+                query_start_loc,
+                seq_lens,
+                token_to_req_indices,
+                is_valid_token,
+                block_table,
+                block_table.stride(0),
+                self.block_size,
                 token_offset=num_decode_tokens,
                 TRITON_BLOCK_SIZE=1024,
             )
@@ -747,14 +768,17 @@ def _compute_swa_indices_and_lens_kernel(
     token_offset,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    token_idx = pid + token_offset
-    is_valid = tl.load(is_valid_token_ptr + token_idx)
-    if not is_valid:
-        tl.store(swa_lens_ptr + pid, 0)
-        return
+    """Compute prefill gather_lens in a single pass."""
+    offset = tl.arange(0, BLOCK_SIZE)
+    mask = offset < num_prefills
+    # SM12x + Triton 3.6 raises IMA on out-of-bounds address arithmetic for
+    # masked-off lanes even though the load mask gates the actual read, so
+    # clamp the offset. Caller guarantees num_prefills > 0.
+    safe_offset = tl.minimum(offset, num_prefills - 1)
 
-    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    seq_len = tl.load(seq_lens_ptr + num_decodes + safe_offset, mask=mask)
+    qsl_start = tl.load(query_start_loc_ptr + num_decodes + safe_offset, mask=mask)
+    qsl_end = tl.load(query_start_loc_ptr + num_decodes + safe_offset + 1, mask=mask)
 
     query_start = tl.load(query_start_loc_ptr + req_idx)
     query_end = tl.load(query_start_loc_ptr + req_idx + 1)
@@ -773,26 +797,8 @@ def _compute_swa_indices_and_lens_kernel(
     for i in range(0, window_size, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
 
-        pos_offset = start_pos + offset
-        block_indices = pos_offset // block_size
-        block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=pos_offset < end_pos,
-        )
-        block_offsets = pos_offset % block_size
-        slot_ids = block_numbers * block_size + block_offsets
-
-        slot_ids = tl.where(offset < swa_len, slot_ids, -1)
-        tl.store(
-            swa_indices_ptr + pid * swa_indices_stride + offset,
-            slot_ids,
-            mask=offset < window_size,
-        )
-
-
-# TODO(ben): unify this kernel to reduce duplication
 @triton.jit(do_not_specialize=["token_offset"])
-def _compute_dspark_noncausal_swa_indices_kernel(
+def _compute_swa_indices_and_lens_kernel(
     swa_indices_ptr,
     swa_indices_stride,
     swa_lens_ptr,
@@ -808,11 +814,6 @@ def _compute_dspark_noncausal_swa_indices_kernel(
     token_offset,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
-    """Non-causal per-token indices for the DSpark draft block.
-
-    Here, we populate the topk indices with the trailing window of context tokens,
-    plus all query tokens (including future ones).
-    """
     pid = tl.program_id(0)
     token_idx = pid + token_offset
     is_valid = tl.load(is_valid_token_ptr + token_idx)
