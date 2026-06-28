@@ -294,9 +294,29 @@ class RoutedExperts(PluggableLayer):
 
     @staticmethod
     def _to_scalar(loaded_weight: torch.Tensor) -> torch.Tensor:
-        # Per-tensor scales arrive 0-D or as shape-(1,) (llm-compressor NVFP4);
-        # reduce to a 0-D scalar. numel > 1 raises instead of broadcasting.
+        # Per-tensor scales arrive 0-D or as shape-(1,) (e.g. llm-compressor /
+        # ModelOpt NVFP4 input scales); reduce to a 0-D scalar. numel > 1 raises
+        # (reshape to ()) instead of silently broadcasting/picking an element.
         return loaded_weight.reshape(())
+
+    @staticmethod
+    def _normalize_loaded_weight_for_copy(
+        expert_data: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if (
+            e8m0_dtype is not None
+            and expert_data.dtype == torch.uint8
+            and loaded_weight.dtype == e8m0_dtype
+        ):
+            # ue8m0 scales (DeepSeek-V4 mega-MoE) share the byte layout of
+            # uint8; reinterpret the bits instead of value-casting.
+            loaded_weight = loaded_weight.view(torch.uint8)
+        if loaded_weight.shape != expert_data.shape and loaded_weight.numel() == 1:
+            # Per-tensor scales arrive 0-D or as shape-(1,) (llm-compressor
+            # NVFP4); match the destination shape so copy_ won't broadcast.
+            loaded_weight = loaded_weight.reshape(expert_data.shape)
+        return loaded_weight
 
     def _load_per_tensor_weight_scale(
         self,
