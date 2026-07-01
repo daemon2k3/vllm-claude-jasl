@@ -21,7 +21,6 @@ from vllm.models.deepseek_v4.nvidia.dspark_triton import (
 from vllm.platforms import current_platform
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.dspark_sampling import (
     sample_dspark_markov_block,
@@ -531,6 +530,43 @@ def test_load_dspark_model_shares_direct_draft_embedding_and_head(monkeypatch):
     assert draft.head is target.lm_head
     assert draft.embed_tokens is not old_embed
     assert draft.head is not old_head
+
+
+def test_dspark_shares_target_embedding_and_lm_head(monkeypatch):
+    class DummyPPGroup:
+        world_size = 1
+
+    class TargetModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Embedding(8, 4)
+            self.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+    class DraftModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(8, 4)
+            self.head = torch.nn.Linear(4, 8, bias=False)
+
+    from vllm.v1.spec_decode import dspark as dspark_proposer
+
+    monkeypatch.setattr(dspark_proposer, "get_pp_group", lambda: DummyPPGroup())
+    target = TargetModel()
+    draft = DraftModel()
+    old_embed = draft.embed_tokens
+    old_head = draft.head
+
+    proposer = object.__new__(DSparkProposer)
+    proposer.model = draft
+
+    proposer._maybe_share_embeddings(target)
+    proposer._maybe_share_lm_head(target)
+
+    assert proposer.model.embed_tokens is target.model.embed_tokens
+    assert proposer.model.head is target.lm_head
+    assert proposer.model.embed_tokens is not old_embed
+    assert proposer.model.head is not old_head
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
