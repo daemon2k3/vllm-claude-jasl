@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
 from typing_extensions import override
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_pp_group, graph_capture
+from vllm.distributed.parallel_state import graph_capture
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -21,8 +21,12 @@ from vllm.v1.spec_decode.dspark_sampling import (
 logger = init_logger(__name__)
 
 
+def _env_bool(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
 def _spec_bool(spec_config: Any, attr: str, env_name: str) -> bool:
-    return bool(getattr(spec_config, attr, False)) or envs.env_bool(env_name)
+    return bool(getattr(spec_config, attr, False)) or _env_bool(env_name)
 
 
 class _DSparkForwardCUDAGraph:
@@ -39,6 +43,8 @@ class _DSparkForwardCUDAGraph:
         self.model = model
         self.graph: torch.cuda.CUDAGraph | None = None
         self.output: torch.Tensor | None = None
+        self.capture_args: tuple[Any, ...] | None = None
+        self.capture_kwargs: dict[str, Any] | None = None
         self.input_ptrs: tuple[int, ...] | None = None
         self.input_key: tuple[Any, ...] | None = None
         self.disabled = False
@@ -192,6 +198,8 @@ class _DSparkForwardCUDAGraph:
                     output = self.model(**capture_kwargs)
             self.graph = graph
             self.output = output
+            self.capture_args = ()
+            self.capture_kwargs = capture_kwargs
             self.input_key = input_key
             self.input_ptrs = input_ptrs
             logger.info(
@@ -250,6 +258,7 @@ class DSparkProposer(DFlashProposer):
         self._dspark_context_hidden_states: torch.Tensor | None = None
         self._dspark_context_positions: torch.Tensor | None = None
         self._dspark_query_start_loc: torch.Tensor | None = None
+        self._dspark_main_indices: torch.Tensor | None = None
         self._dspark_batch_size: int = 0
         self._dspark_num_rejected_tokens: torch.Tensor | None = None
         self._dspark_tokens_out = torch.empty(
@@ -258,8 +267,10 @@ class DSparkProposer(DFlashProposer):
             device=device,
         )
         self._dspark_draft_probs_out: torch.Tensor | None = None
-        self.use_fused_markov_sampler = bool(
-            getattr(spec_config, "dspark_fused_markov_sampler", True)
+        self.use_fused_markov_sampler = _spec_bool(
+            spec_config,
+            "dspark_fused_markov_sampler",
+            "VLLM_DSPARK_FUSED_MARKOV_SAMPLER",
         )
         self.use_forward_cudagraph = _spec_bool(
             spec_config,
@@ -295,49 +306,6 @@ class DSparkProposer(DFlashProposer):
                 return
             self.model = _DSparkForwardCUDAGraph(self, self.model)
             logger.info("DSpark draft forward CUDA graph is enabled.")
-
-    @override
-    def _maybe_share_embeddings(self, target_language_model: Any) -> None:
-        if get_pp_group().world_size != 1:
-            logger.info(
-                "DSpark draft model keeps separate embeddings under pipeline "
-                "parallelism."
-            )
-            return
-
-        target_inner_model = getattr(target_language_model, "model", None)
-        target_embed_tokens = getattr(target_inner_model, "embed_tokens", None)
-        if target_embed_tokens is None or not hasattr(self.model, "embed_tokens"):
-            logger.warning(
-                "DSpark could not share target embeddings; keeping draft "
-                "embed_tokens."
-            )
-            return
-
-        del self.model.embed_tokens
-        self.model.embed_tokens = target_embed_tokens
-        logger.info("Shared target model embeddings with DSpark draft model.")
-
-    @override
-    def _maybe_share_lm_head(self, target_language_model: Any) -> None:
-        if get_pp_group().world_size != 1:
-            logger.info(
-                "DSpark draft model keeps separate lm_head under pipeline "
-                "parallelism."
-            )
-            return
-
-        if not hasattr(target_language_model, "lm_head") or not hasattr(
-            self.model, "head"
-        ):
-            logger.warning(
-                "DSpark could not share target lm_head; keeping draft head."
-            )
-            return
-
-        del self.model.head
-        self.model.head = target_language_model.lm_head
-        logger.info("Shared target model lm_head with DSpark draft model.")
 
     @override
     def initialize_attn_backend(
@@ -380,6 +348,7 @@ class DSparkProposer(DFlashProposer):
         if num_rejected_tokens_gpu is not None:
             valid_context_end = valid_context_end - num_rejected_tokens_gpu
         sample_indices = valid_context_end - 1
+        self._dspark_main_indices = sample_indices
         self._dspark_main_hidden = target_hidden_states[sample_indices.long()]
         self._dspark_main_positions = target_positions[sample_indices.long()]
         self._dspark_context_hidden_states = target_hidden_states
@@ -476,12 +445,13 @@ class DSparkProposer(DFlashProposer):
         del mm_embed_inputs
         if self._dspark_main_hidden is None:
             raise RuntimeError("DSpark target hidden states were not initialized")
+        context_main_x = None
         if (
             self._dspark_context_hidden_states is not None
             and self._dspark_context_positions is not None
             and self._dspark_query_start_loc is not None
         ):
-            self.model.precompute_and_store_context_kv(
+            context_main_x = self.model.precompute_and_store_context_kv(
                 self._dspark_context_hidden_states,
                 self._dspark_context_positions,
                 query_start_loc=self._dspark_query_start_loc,
@@ -495,6 +465,7 @@ class DSparkProposer(DFlashProposer):
             inputs_embeds=None,
             main_positions=self._dspark_main_positions,
         )
+        del context_main_x
         if self.use_forward_cudagraph:
             model_kwargs = self._maybe_prepare_forward_cudagraph_inputs(
                 model_kwargs,

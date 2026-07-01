@@ -177,12 +177,6 @@ def _deepseek_v4_sm12x_fp8_einsum_quant_kernel(
     ``per_token_group_quant_fp8`` kernel launch that would otherwise quantize
     this same accumulator's BF16 store right back down to FP8 one step later.
     """
-    # Same alignment restoration as the BF16 einsum kernel above: both group
-    # strides are provably divisible by 16, so hint them while keeping them
-    # runtime (no per-shape recompile). Without this the runtime strides drop to
-    # divisibility=1 and narrow the load.
-    a_stride_group = tl.multiple_of(a_stride_group, 16)
-    a_scale_stride_group = tl.multiple_of(a_scale_stride_group, 16)
     token_block = tl.program_id(0)
     out_block = tl.program_id(1)
     group = tl.program_id(2)

@@ -193,6 +193,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -630,6 +631,9 @@ class GPUModelRunner(
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dspark():
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
@@ -4627,6 +4631,7 @@ class GPUModelRunner(
             # TP/EP/DP collectives), independent of padded-batch timing.
             drafter_runs_model_forward = (
                 spec_config.use_eagle()
+                or spec_config.use_dspark()
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
             )
@@ -4998,8 +5003,6 @@ class GPUModelRunner(
         if not draft_probs_rows:
             return None
         if len(draft_probs_rows) == 1 and draft_probs_rows[0].is_contiguous():
-            # Rejection sampling consumes this view in the same step; the
-            # persistent draft-probs buffer may be reused by the next proposal.
             return draft_probs_rows[0]
         return torch.cat(draft_probs_rows, dim=0).contiguous()
 
@@ -5149,6 +5152,7 @@ class GPUModelRunner(
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
+            or spec_config.use_dspark()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
@@ -5513,6 +5517,8 @@ class GPUModelRunner(
         hf_config = self.speculative_config.draft_model_config.hf_config
 
         layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
         if not layer_ids:
             dflash_config = getattr(hf_config, "dflash_config", None)
             eagle_config = getattr(hf_config, "eagle_config", None)
@@ -6150,6 +6156,7 @@ class GPUModelRunner(
 
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
+                or self.speculative_config.use_dspark()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
             ):
@@ -7144,6 +7151,7 @@ class GPUModelRunner(
         # Initialize drafter attention backend
         if self.speculative_config and (
             self.speculative_config.use_eagle()
+            or self.speculative_config.use_dspark()
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
@@ -7198,7 +7206,7 @@ class GPUModelRunner(
         # Initialize drafter's cudagraph dispatcher if using spec decode.
         if self.speculative_config and (
             self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+            or self.speculative_config.use_dspark()
             or self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(
