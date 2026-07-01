@@ -206,63 +206,22 @@ def _insert_context_kv(
 ) -> None:
     """RoPE + quant + paged-cache insert of (already kv_norm'd) context KV.
 
-    Reuses the DSV4 fused insert ops (which also process a query; we pass a dummy
-    query and discard it, since context tokens have no query). Mirrors
-    ``DeepseekV4Attention._fused_qnorm_rope_kv_insert``.
-    """
-    swa_cache = attn.swa_cache_layer.kv_cache
-    block_size = attn.swa_cache_layer.block_size
-    cos_sin_cache = attn.rotary_emb.cos_sin_cache
-    cache_dtype = swa_cache.dtype
-    n_ctx = kv.shape[0]
-    dummy_q = torch.zeros(
-        (n_ctx, attn.n_local_heads, attn.head_dim),
-        dtype=kv.dtype,
-        device=kv.device,
-    )
-    if cache_dtype == torch.uint8:
-        # fp8_ds_mla UE8M0 paged layout
-        swa_2d = swa_cache.view(swa_cache.shape[0], -1)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            dummy_q,
-            kv,
-            swa_2d,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            attn.padded_heads,
-            attn.eps,
-            block_size,
-        )
-    elif cache_dtype == torch.bfloat16:
-        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
-            dummy_q,
-            kv,
-            swa_3d,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            attn.eps,
-            block_size,
-        )
-    else:  # per-tensor fp8 (torch.float8_e4m3fn)
-        # TODO(ben): double-check if this is being dispatched correctly for FI backend
-        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
-        dummy_q_fp8 = torch.zeros_like(dummy_q, dtype=torch.float8_e4m3fn)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
-            dummy_q,
-            kv,
-            dummy_q_fp8,
-            swa_3d,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            attn._flashinfer_fp8_kv_scale,
-            attn._flashinfer_fp8_q_scale_inv,
-            attn.eps,
-            block_size,
-        )
+class DeepSeekV4DSpark(nn.Module):
+    """DSpark draft model for fixed-block speculative decoding."""
+
+    uses_query_start_loc_context_kv = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        assert vllm_config.speculative_config is not None
+        config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.config = config
+        self.block_size = int(getattr(config, "dspark_block_size", 0))
+        self.target_layer_ids = tuple(getattr(config, "dspark_target_layer_ids", ()))
+        if self.block_size <= 0:
+            raise ValueError("DSpark requires dspark_block_size > 0")
+        if not self.target_layer_ids:
+            raise ValueError("DSpark requires dspark_target_layer_ids")
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
@@ -307,15 +266,40 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # layer, named by its prefix.
         return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
 
+    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.main_norm(_linear_output(self.main_proj(aux_hidden_states)))
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mappings: list[torch.Tensor | None] | None = None,
-    ) -> None:
-        self.model.precompute_and_store_context_kv(
-            context_states, context_positions, context_slot_mappings
+        context_slot_mapping: torch.Tensor | None = None,
+        *,
+        query_start_loc: torch.Tensor | None = None,
+        batch_size: int | None = None,
+        num_rejected_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        del context_slot_mapping
+        if query_start_loc is None or context_states.numel() == 0:
+            return None
+        if batch_size is None:
+            batch_size = int(query_start_loc.shape[0] - 1)
+        main_x = (
+            self.combine_hidden_states(context_states)
+            if context_states.shape[-1] == self.dspark_aux_hidden_size
+            else context_states
         )
+        for idx, layer in enumerate(self.layers.values()):
+            if idx >= self.runtime_num_dspark_layers:
+                break
+            layer.store_main_kv(
+                main_x,
+                context_positions,
+                query_start_loc,
+                batch_size,
+                num_rejected_tokens,
+            )
+        return main_x
 
     def forward(
         self,
@@ -343,7 +327,25 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
-    # --- Weight loading ----------------------------------------------------
+    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self._markov_w1_embedding(token_ids)
+
+    def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        return _linear_output(self.markov_w2(markov_embed))
+
+    def apply_dspark_markov_bias(
+        self,
+        base_logits: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        step_idx: int,
+    ) -> torch.Tensor:
+        del step_idx
+        markov_embed = self._markov_w1_embedding(prev_token_ids)
+        markov_bias = _linear_output(self.markov_w2(markov_embed))
+        if self.use_markov_inplace_add and markov_bias.dtype == base_logits.dtype:
+            markov_bias.add_(base_logits)
+            return markov_bias
+        return base_logits + markov_bias
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
