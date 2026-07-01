@@ -78,6 +78,15 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
+logger = init_logger(__name__)
+
+
+def _dspark_linear_scale(layer: nn.Module) -> torch.Tensor | None:
+    scale = getattr(layer, "weight_scale_inv", None)
+    if scale is None:
+        scale = getattr(layer, "weight_scale", None)
+    return scale
+
 
 class DeepseekV4MLP(nn.Module):
     def __init__(
@@ -521,6 +530,15 @@ class DeepseekV4MoE(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
+        self._layer_idx = extract_layer_index(prefix)
+        self._is_dspark_runtime_layer = self._layer_idx >= config.num_hidden_layers
+        self._dspark_fused_shared_experts_quant = bool(
+            getattr(
+                vllm_config.speculative_config,
+                "dspark_fused_shared_experts_quant",
+                True,
+            )
+        )
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )

@@ -9,7 +9,8 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-from collections.abc import Iterable
+import typing
+from collections.abc import Callable, Iterable
 
 import regex as re
 import torch
@@ -36,8 +37,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.qwen3_dspark import (
-    DSparkMarkovHead,
+from vllm.model_executor.models.utils import get_draft_quant_config
+from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
+from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
+)
+from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
+    deepseek_v4_fp8_einsum,
+    deepseek_v4_sm12x_fp8_einsum_quant,
+)
+from vllm.v1.attention.backends.mla.sparse_mla_env import (
+    triton_sparse_mla_head_block_size,
+)
+from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+    matmul_sparse_mla_attention_with_sink,
 )
 from vllm.model_executor.models.utils import maybe_prefix
 
@@ -45,6 +58,11 @@ from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
     make_deepseek_v4_expert_params_mapping,
+)
+from .dspark_triton import (
+    dspark_context_kv_store,
+    dspark_qkv_postprocess,
+    dspark_triton_attention,
 )
 
 logger = init_logger(__name__)
@@ -54,8 +72,69 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
-class DSparkDeepseekV4Model(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+def _spec_bool(vllm_config: VllmConfig, attr: str, default: bool = True) -> bool:
+    spec_config = vllm_config.speculative_config
+    return bool(getattr(spec_config, attr, default))
+
+
+def _linear_output(output: torch.Tensor | tuple[torch.Tensor, object]) -> torch.Tensor:
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
+
+def _rmsnorm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
+    x_float = x.float()
+    return x_float.mul(torch.rsqrt(x_float.square().mean(-1, keepdim=True) + eps))
+
+
+def _apply_rope_gptj_last(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Apply DS4 RoPE to the last rope_dim features.
+
+    This mirrors the DS4 fused qnorm/kv-insert kernels' PyTorch reference:
+    GPT-J/interleaved pairs, cos||sin cache layout, and RoPE on the tail of the
+    head dimension.
+    """
+    rope_dim = cos_sin_cache.shape[-1]
+    half = rope_dim // 2
+    head_dim = x.shape[-1]
+    nope_dim = head_dim - rope_dim
+
+    cs = cos_sin_cache.index_select(0, positions.long()).to(torch.float32)
+    cos = cs[..., :half]
+    sin = cs[..., half:]
+
+    rope = x[..., nope_dim:].float()
+    shape = rope.shape
+    rope = rope.reshape(*shape[:-1], half, 2)
+    even = rope[..., 0]
+    odd = rope[..., 1]
+
+    while cos.dim() < even.dim():
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+    new_even = torch.addcmul(-odd * sin, even, cos)
+    new_odd = torch.addcmul(odd * cos, even, sin)
+    rope_rotated = torch.stack((new_even, new_odd), dim=-1).reshape(shape)
+
+    out = x.clone()
+    out[..., nope_dim:] = rope_rotated.to(out.dtype)
+    return out
+
+
+class DeepSeekV4DSparkLayer(nn.Module):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        dspark_layer_idx: int,
+        prefix: str,
+    ) -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -63,39 +142,102 @@ class DSparkDeepseekV4Model(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
-        self.rms_norm_eps = config.rms_norm_eps
-        self.num_hidden_layers = config.num_hidden_layers
-        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
-
-        self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
-
-        # Shared with the target (aliased by the speculator's loading utility).
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
+        self.hc_post_alpha = 2.0
+        self.block_size = int(getattr(config, "dspark_block_size", 0))
+        runtime_layer_idx = config.num_hidden_layers + dspark_layer_idx
+        runtime_prefix = (
+            f"{prefix}.layers.{runtime_layer_idx}"
+            if prefix
+            else f"layers.{runtime_layer_idx}"
         )
 
-        self.main_proj = ReplicatedLinear(
-            config.hidden_size * len(self.target_layer_ids),
-            config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=vllm_config.quant_config,
-            prefix=maybe_prefix(prefix, "main_proj"),
+        self.attn = _select_dsv4_attn_cls(vllm_config)(
+            vllm_config,
+            prefix=f"{runtime_prefix}.attn",
+            topk_indices_buffer=None,
+            aux_stream_list=None,
         )
-        self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{runtime_prefix}.ffn")
+        self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
 
-        current_vllm_config = get_current_vllm_config()
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV4DecoderLayer(
-                    current_vllm_config,
-                    prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
-                )
-                for i in range(self.num_dspark_layers)
-            ]
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
+        hc_dim = self.hc_mult * self.hidden_size
+        self.hc_attn_fn = nn.Parameter(
+            torch.empty((mix_hc, hc_dim), dtype=torch.float32),
+            requires_grad=False,
         )
+        self.hc_ffn_fn = nn.Parameter(
+            torch.empty((mix_hc, hc_dim), dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.hc_attn_base = nn.Parameter(
+            torch.empty(mix_hc, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.hc_ffn_base = nn.Parameter(
+            torch.empty(mix_hc, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.hc_attn_scale = nn.Parameter(
+            torch.empty(3, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.hc_ffn_scale = nn.Parameter(
+            torch.empty(3, dtype=torch.float32),
+            requires_grad=False,
+        )
+
+        max_batch = max(1, int(vllm_config.scheduler_config.max_num_seqs))
+        window = int(config.sliding_window)
+        self.register_buffer(
+            "_main_kv_cache",
+            torch.zeros(
+                max_batch,
+                window,
+                config.head_dim,
+                dtype=vllm_config.model_config.dtype,
+            ),
+            persistent=False,
+        )
+        self.use_materialized_attention = _spec_bool(
+            vllm_config,
+            "dspark_materialized_attention",
+        )
+        self.use_triton_attention = _spec_bool(
+            vllm_config,
+            "dspark_triton_attention",
+        )
+        self.use_triton_qkv_postprocess = _spec_bool(
+            vllm_config,
+            "dspark_triton_qkv_postprocess",
+        )
+        self.use_triton_context_kv_store = _spec_bool(
+            vllm_config,
+            "dspark_triton_context_kv_store",
+        )
+        self.use_fused_o_proj_quant = _spec_bool(
+            vllm_config,
+            "dspark_fused_o_proj_quant",
+        )
+        self.materialized_head_block_size = triton_sparse_mla_head_block_size() or 1
+        self.register_buffer(
+            "_score_buffer",
+            torch.empty(
+                max_batch * self.block_size,
+                self.attn.n_local_heads,
+                window + self.block_size,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+
+    @property
+    def window_size(self) -> int:
+        return int(self.attn.window_size)
+
+    def _wo_b_output(self, wo_b_input: torch.Tensor) -> torch.Tensor:
+        return _linear_output(self.attn.wo_b(wo_b_input))
 
         # Heads: final norm + hc_head, and the Markov head
         # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
@@ -170,17 +312,209 @@ class DSparkDeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_input_ids(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        del main_x
+        block_size = self.block_size
+        q, draft_kv = self._project_draft_q_kv(x, positions)
+        q = q.view(batch_size, block_size, self.attn.n_local_heads, self.attn.head_dim)
+        draft_kv = draft_kv.view(batch_size, block_size, self.attn.head_dim)
 
-        residual = post_mix = res_mix = None
-        for layer in self.layers:
-            hidden_states, residual, post_mix, res_mix = layer(
-                hidden_states,
-                positions,
-                input_ids,
+        cache_kv = self._main_kv_cache[:batch_size].to(draft_kv.dtype)
+        if self.use_triton_attention:
+            o = dspark_triton_attention(
+                q,
+                cache_kv,
+                draft_kv,
+                main_positions.long(),
+                self.attn.attn_sink[: self.attn.n_local_heads],
+                float(self.attn.scale),
+            ).reshape(
+                batch_size * block_size,
+                self.attn.n_local_heads,
+                self.attn.head_dim,
+            )
+        else:
+            kv = torch.cat([cache_kv, draft_kv], dim=1)
+
+            cache_arange = torch.arange(
+                self.window_size,
+                device=positions.device,
+                dtype=main_positions.dtype,
+            )
+            valid_cache = cache_arange.unsqueeze(0) <= torch.minimum(
+                main_positions.long().unsqueeze(1),
+                torch.full_like(
+                    main_positions.long().unsqueeze(1), self.window_size - 1
+                ),
+            )
+            valid = torch.cat(
+                [
+                    valid_cache,
+                    torch.ones(
+                        batch_size,
+                        block_size,
+                        dtype=torch.bool,
+                        device=positions.device,
+                    ),
+                ],
+                dim=1,
+            )
+            if self.use_materialized_attention:
+                q_tokens = q.reshape(
+                    batch_size * block_size,
+                    self.attn.n_local_heads,
+                    self.attn.head_dim,
+                )
+                kv_tokens = (
+                    kv.unsqueeze(1)
+                    .expand(batch_size, block_size, kv.shape[1], kv.shape[2])
+                    .reshape(batch_size * block_size, kv.shape[1], kv.shape[2])
+                    .contiguous()
+                )
+                valid_tokens = (
+                    valid.unsqueeze(1)
+                    .expand(batch_size, block_size, valid.shape[1])
+                    .reshape(batch_size * block_size, valid.shape[1])
+                    .contiguous()
+                )
+                o = torch.empty_like(q_tokens)
+                score_buffer = self._score_buffer[
+                    : q_tokens.shape[0],
+                    : self.attn.n_local_heads,
+                    : kv.shape[1],
+                ]
+                matmul_sparse_mla_attention_with_sink(
+                    q_tokens,
+                    kv_tokens,
+                    valid_tokens,
+                    float(self.attn.scale),
+                    self.attn.attn_sink,
+                    o,
+                    num_heads=self.attn.n_local_heads,
+                    score_buffer=score_buffer,
+                    head_block_size=self.materialized_head_block_size,
+                )
+            else:
+                scores = torch.einsum("bqhd,bnd->bqhn", q.float(), kv.float())
+                scores *= float(self.attn.scale)
+                scores = scores.masked_fill(
+                    ~valid[:, None, None, :], float("-inf")
+                )
+
+                sink = self.attn.attn_sink[: self.attn.n_local_heads].view(
+                    1, 1, -1, 1
+                )
+                max_score = torch.maximum(
+                    scores.max(dim=-1, keepdim=True).values, sink
+                )
+                exp_scores = torch.exp(scores - max_score).masked_fill(
+                    ~valid[:, None, None, :], 0.0
+                )
+                denom = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(
+                    sink - max_score
+                )
+                o = torch.einsum(
+                    "bqhn,bnd->bqhd", exp_scores / denom, kv.float()
+                )
+                o = o.to(x.dtype).reshape(
+                    batch_size * block_size,
+                    self.attn.n_local_heads,
+                    self.attn.head_dim,
+                )
+        return self._o_proj(o, positions)
+
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        attn = self.attn
+        if not self.use_fused_o_proj_quant:
+            return _linear_output(attn._o_proj(o, positions))
+
+        required_attrs = (
+            "_einsum_recipe",
+            "_tma_aligned_scales",
+            "wo_a",
+            "wo_b",
+            "rotary_emb",
+            "n_local_groups",
+            "n_local_heads",
+            "nope_head_dim",
+            "rope_head_dim",
+            "o_lora_rank",
+        )
+        if not all(hasattr(attn, attr) for attr in required_attrs):
+            return _linear_output(attn._o_proj(o, positions))
+
+        if (
+            self.use_fused_o_proj_quant
+            and tuple(attn._einsum_recipe) == (1, 128, 128)
+            and not attn._tma_aligned_scales
+        ):
+            fused_output = self._o_proj_fused_quant(attn, o, positions)
+            if fused_output is not None:
+                return fused_output
+
+        o_fp8, o_scale = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            attn.rotary_emb.cos_sin_cache,
+            n_groups=attn.n_local_groups,
+            heads_per_group=attn.n_local_heads // attn.n_local_groups,
+            nope_dim=attn.nope_head_dim,
+            rope_dim=attn.rope_head_dim,
+            tma_aligned_scales=attn._tma_aligned_scales,
+        )
+        z = torch.empty(
+            (o.shape[0], attn.n_local_groups, attn.o_lora_rank),
+            device=o.device,
+            dtype=torch.bfloat16,
+        )
+        wo_a_scale = getattr(attn.wo_a, "weight_scale_inv", None)
+        if wo_a_scale is None:
+            wo_a_scale = attn.wo_a.weight_scale
+        deepseek_v4_fp8_einsum(
+            o_fp8,
+            o_scale,
+            attn.wo_a.weight,
+            wo_a_scale,
+            z,
+            "bhr,hdr->bhd",
+            list(attn._einsum_recipe),
+        )
+        wo_b_input = z.flatten(1)
+        output = self._wo_b_output(wo_b_input)
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        main_x: torch.Tensor,
+        main_positions: torch.Tensor,
+        batch_size: int,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn_norm_weight = self.attn_norm.weight.data
+        attn_norm_eps = self.attn_norm.variance_epsilon
+        if residual is None:
+            residual = x
+            post_mix, res_mix, x = mhc_pre_tilelang(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                norm_weight=attn_norm_weight,
+                norm_eps=attn_norm_eps,
+            )
+        else:
+            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+                x,
+                residual,
                 post_mix,
                 res_mix,
                 residual,
@@ -223,6 +557,16 @@ class DeepSeekV4DSpark(nn.Module):
         if not self.target_layer_ids:
             raise ValueError("DSpark requires dspark_target_layer_ids")
 
+        self.hc_mult = config.hc_mult
+        self.hc_eps = config.hc_eps
+        self.rms_norm_eps = config.rms_norm_eps
+        self.num_dspark_layers = len(self.target_layer_ids)
+        self.runtime_num_dspark_layers = self.num_dspark_layers
+        self.max_batch = max(1, int(vllm_config.scheduler_config.max_num_seqs))
+        hidden_size = int(config.hidden_size)
+        dtype = vllm_config.model_config.dtype
+        quant_config = get_draft_quant_config(vllm_config)
+        self.dspark_aux_hidden_size = hidden_size * len(self.target_layer_ids)
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
@@ -253,7 +597,32 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
-    # --- Hooks used by the speculator -------------------------------------
+        markov_rank = int(getattr(config, "dspark_markov_rank", 256))
+        self.markov_w1 = VocabParallelEmbedding(
+            config.vocab_size,
+            markov_rank,
+            prefix=f"{prefix}mtp.2.markov_head.markov_w1",
+        )
+        self.markov_w2 = ReplicatedLinear(
+            markov_rank,
+            config.vocab_size,
+            bias=False,
+            params_dtype=dtype,
+            prefix=f"{prefix}mtp.2.markov_head.markov_w2",
+            return_bias=False,
+        )
+        self.use_markov_inplace_add = _spec_bool(
+            vllm_config,
+            "dspark_markov_inplace_add",
+        )
+        self.confidence_head = ReplicatedLinear(
+            hidden_size + markov_rank,
+            1,
+            bias=False,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}mtp.2.confidence_head.proj",
+            return_bias=False,
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -463,38 +832,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        self._finalize_moe()
+        for layer_idx in range(self.num_dspark_layers):
+            layer_prefix = f"layers.{layer_idx}."
+            if not any(name.startswith(layer_prefix) for name in loaded_params):
+                raise ValueError(
+                    f"DSpark layer mtp.{layer_idx} weights missing from checkpoint."
+                )
+        self.finalize_mega_moe_weights()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
-    def _finalize_moe(self) -> None:
-        for layer in self.model.layers:
-            layer.ffn.finalize_mega_moe_weights()
-
-    def _remap_dspark_name(self, name: str) -> str | None:
-        """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
-
-        Returns None for non-mtp weights (owned by the target model).
-        """
-        m = re.match(r"mtp\.(\d+)\.(.*)", name)
-        if m is None:
-            return None
-        stage = int(m.group(1))
-        rest = m.group(2)
-        # The confidence head is not wired into inference yet; drop its weights.
-        if rest.startswith("confidence_head."):
-            return None
-        # Head-stack params live at model level (mtp.last), context combiner at
-        # model level (mtp.0); everything else is a per-layer decoder block.
-        head_prefixes = (
-            "norm.",
-            "hc_head_fn",
-            "hc_head_base",
-            "hc_head_scale",
-            "markov_head.",
-        )
-        if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
-            head_prefixes
-        ):
-            return f"model.{rest}"
-        return f"model.layers.{stage}.{rest}"
+    def finalize_mega_moe_weights(self) -> None:
+        for layer in self.layers.values():
+            layer.finalize_mega_moe_weights()
