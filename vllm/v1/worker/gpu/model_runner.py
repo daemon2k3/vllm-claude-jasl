@@ -671,24 +671,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.pooling_runner is not None
         self.pooling_runner.dummy_pooler_run(hidden_states)
 
+    def _reserve_profile_scratch(self) -> None:
+        seen: set[int] = set()
+        for module in self.compilation_config.static_forward_context.values():
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            reserve = getattr(module, "reserve_profile_scratch", None)
+            if reserve is not None:
+                reserve()
+
     @torch.inference_mode()
     def profile_run(self) -> None:
-        if self.supports_mm_inputs and self.is_first_pp_rank:
-            mm_config = self.model_config.multimodal_config
-            if mm_config is not None and not mm_config.skip_mm_profiling:
-                mm_budget = MultiModalBudget(
-                    self.vllm_config,
-                    self.mm_registry,
-                    enable_cache=False,
-                )
-                dummy_mm_inputs = get_dummy_encoder_profile_inputs(
-                    self.mm_registry,
-                    mm_budget,
-                )
-                self.model_state.encoder_runner.profile_encoder_cache(
-                    dummy_mm_inputs, mm_budget
-                )
-
+        self._reserve_profile_scratch()
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
