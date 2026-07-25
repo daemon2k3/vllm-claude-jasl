@@ -262,12 +262,13 @@ void fused_qk_norm_rope(torch::stable::Tensor& qkv, int64_t num_heads_q,
                         torch::stable::Tensor& position_ids,
                         int64_t forced_token_heads_per_warp);
 
-torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
-    torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor& q_out, torch::stable::Tensor& k_cache,
+    torch::stable::Tensor const& slot_mapping,
     torch::stable::Tensor const& position_ids,
-    torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
-    double eps, int64_t cache_block_size);
+    torch::stable::Tensor const& cos_sin_cache, double eps,
+    int64_t cache_block_size);
 
 void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
     torch::stable::Tensor& q, torch::stable::Tensor const& kv,
@@ -460,10 +461,14 @@ void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  const torch::stable::Tensor& block_mapping);
 
 // Batch swap: submit all block copies in a single driver call.
+// When use_batch_api is false, skip cuMemcpyBatchAsync/hipMemcpyBatchAsync
+// and use per-descriptor cudaMemcpyAsync fallback (safe for very large
+// descriptor counts that trigger driver batch-API segfaults).
 void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                        const torch::stable::Tensor& dst_ptrs,
                        const torch::stable::Tensor& sizes,
-                       bool is_src_access_order_any);
+                       bool is_src_access_order_any,
+                       bool use_batch_api = true);
 
 void reshape_and_cache(torch::stable::Tensor& key, torch::stable::Tensor& value,
                        torch::stable::Tensor& key_cache,
