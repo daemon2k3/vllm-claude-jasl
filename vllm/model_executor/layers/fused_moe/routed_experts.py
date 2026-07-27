@@ -114,6 +114,7 @@ class RoutedExperts(PluggableLayer):
         self.e_score_correction_bias = e_score_correction_bias
         self.apply_router_weight_on_input = apply_router_weight_on_input
         # End random parameters
+        self._loaded_expert_biases: set[str] = set()
 
         self.quant_method = self._get_quant_method(
             self.layer_name,
@@ -232,17 +233,27 @@ class RoutedExperts(PluggableLayer):
         # Update local attributes from ExpertMapManager
         self.local_num_experts = self.expert_map_manager.local_num_experts
         self.expert_placement_strategy = self.expert_map_manager.placement_strategy
-        self.register_buffer("_expert_map", self.expert_map_manager.expert_map)
-        self.register_buffer("expert_mask", self.expert_map_manager.expert_mask)
+        self.register_buffer(
+            "_expert_map", self.expert_map_manager.expert_map, persistent=False
+        )
+        self.register_buffer(
+            "expert_mask", self.expert_map_manager.expert_mask, persistent=False
+        )
 
         # Get routing tables from ExpertMapManager
         routing_tables = self.expert_map_manager.routing_tables
         if routing_tables is not None:
             # Register routing tables as buffers for this layer
             global_to_physical, physical_to_global, local_global = routing_tables
-            self.register_buffer("expert_global_to_physical", global_to_physical)
-            self.register_buffer("expert_physical_to_global", physical_to_global)
-            self.register_buffer("expert_local_to_global", local_global)
+            self.register_buffer(
+                "expert_global_to_physical", global_to_physical, persistent=False
+            )
+            self.register_buffer(
+                "expert_physical_to_global", physical_to_global, persistent=False
+            )
+            self.register_buffer(
+                "expert_local_to_global", local_global, persistent=False
+            )
 
     def _expert_routing_tables(
         self,
@@ -283,9 +294,29 @@ class RoutedExperts(PluggableLayer):
 
     @staticmethod
     def _to_scalar(loaded_weight: torch.Tensor) -> torch.Tensor:
-        # Per-tensor scales arrive 0-D or as shape-(1,) (llm-compressor NVFP4);
-        # reduce to a 0-D scalar. numel > 1 raises instead of broadcasting.
+        # Per-tensor scales arrive 0-D or as shape-(1,) (e.g. llm-compressor /
+        # ModelOpt NVFP4 input scales); reduce to a 0-D scalar. numel > 1 raises
+        # (reshape to ()) instead of silently broadcasting/picking an element.
         return loaded_weight.reshape(())
+
+    @staticmethod
+    def _normalize_loaded_weight_for_copy(
+        expert_data: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if (
+            e8m0_dtype is not None
+            and expert_data.dtype == torch.uint8
+            and loaded_weight.dtype == e8m0_dtype
+        ):
+            # ue8m0 scales (DeepSeek-V4 mega-MoE) share the byte layout of
+            # uint8; reinterpret the bits instead of value-casting.
+            loaded_weight = loaded_weight.view(torch.uint8)
+        if loaded_weight.shape != expert_data.shape and loaded_weight.numel() == 1:
+            # Per-tensor scales arrive 0-D or as shape-(1,) (llm-compressor
+            # NVFP4); match the destination shape so copy_ won't broadcast.
+            loaded_weight = loaded_weight.reshape(expert_data.shape)
+        return loaded_weight
 
     def _load_per_tensor_weight_scale(
         self,
@@ -300,10 +331,12 @@ class RoutedExperts(PluggableLayer):
             # We have to keep the weight scales of w1 and w3 because
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
-            param_data[expert_id][idx] = self._to_scalar(loaded_weight)
+            target = param_data[expert_id][idx]
+            target.copy_(self._normalize_loaded_weight_for_copy(target, loaded_weight))
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
-            param_data[expert_id] = self._to_scalar(loaded_weight)
+            target = param_data[expert_id]
+            target.copy_(self._normalize_loaded_weight_for_copy(target, loaded_weight))
 
     def _load_combined_w13_weight_scale(
         self,
@@ -320,7 +353,7 @@ class RoutedExperts(PluggableLayer):
         loaded_weight = loaded_weight.narrow(
             shard_dim, shard_size * tp_rank, shard_size
         )
-        param.copy_(loaded_weight)
+        param.copy_(self._normalize_loaded_weight_for_copy(param, loaded_weight))
 
     def _load_model_weight_or_group_weight_scale(
         self,
@@ -378,7 +411,9 @@ class RoutedExperts(PluggableLayer):
                 hidden_dim=hidden_dim,
                 shard_dim=shard_dim,
             )
-            expert_data.copy_(loaded_weight)
+            expert_data.copy_(
+                self._normalize_loaded_weight_for_copy(expert_data, loaded_weight)
+            )
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -494,7 +529,9 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        expert_data.copy_(
+            self._normalize_loaded_weight_for_copy(expert_data, loaded_weight)
+        )
 
     def _load_w2(
         self,
@@ -529,7 +566,9 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        expert_data.copy_(
+            self._normalize_loaded_weight_for_copy(expert_data, loaded_weight)
+        )
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -690,6 +729,25 @@ class RoutedExperts(PluggableLayer):
             shard_dim += 1
 
         expert_data = param.data if full_load else param.data[expert_id]
+
+        if "bias" in weight_name:
+            self._loaded_expert_biases.add(weight_name.rsplit(".", 1)[-1])
+            if shard_id == "w2":
+                expert_data = self._narrow_expert_data_for_padding(
+                    expert_data,
+                    loaded_weight,
+                    hidden_dim=0,
+                )
+                expert_data.copy_(loaded_weight)
+            else:
+                self._load_w13(
+                    shard_id=shard_id,
+                    shard_dim=0,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.moe_config.tp_rank,
+                )
+            return True if return_success else None
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:

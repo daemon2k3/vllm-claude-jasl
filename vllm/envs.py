@@ -186,13 +186,38 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
+    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL: bool = True
+    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS: int = 4096
+    VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP: bool = True
+    VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL: bool = True
+    # Default ON (SM12x + FlashInfer >= 0.6.14 kernel present): route DSv4 sparse
+    # MLA through the FlashInfer SM120 packed path (prefill + decode). No effect
+    # elsewhere -- the selector still gates on SM12x + has_flashinfer_trtllm_
+    # sparse_mla_dsv4() and falls back to the Triton FlashMLA path otherwise.
+    # A/B on FI 0.6.14 (GB10 2-node, 616a5723ac): ~parity at 8-32k, and at long
+    # context FI leads clearly -- ctx_pp +12-18%, decode +45-81% at 128k/256k,
+    # both widening with context; arthur 434k 2/2 + GSM8K 0.975. Set =0 for the
+    # Triton FlashMLA path.
+    VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE: bool = True
+    # When the SM120 FlashInfer sparse-MLA backend is active, the packed prefill
+    # runner is used by default. Set =0 to force the FlashMLA indexed-D512 (Triton
+    # split/merge) prefill path. No effect unless that backend is active (see
+    # is_dsv4_sm120_fi_prefill_active).
+    VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL: bool = True
+    VLLM_TRITON_MLA_SPARSE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
+    VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
+    VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
         "relax",
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
-    VLLM_MOE_SKIP_PADDING: bool = False
+    VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -250,6 +275,8 @@ if TYPE_CHECKING:
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
+    VLLM_DSPARK_FORWARD_CUDAGRAPH: bool = False
+    VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
@@ -321,6 +348,13 @@ def maybe_convert_bool(value: str | None) -> bool | None:
     if value is None:
         return None
     return bool(int(value))
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 def maybe_convert_json_str_or_file(value: str | None) -> dict[str, Any] | None:
@@ -1490,6 +1524,59 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
+    "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL", "1"))
+    ),
+    # Minimum prefill sequence length to admit a row to the indexed-D512 fast
+    # prefill path. Lower = more (shorter / early-chunk) prefills use the fast
+    # kernel. 4096 measured +9-59% short/medium-prefill tok/s (biggest at the
+    # 4-8k band), GSM8K-clean and KV-cache-neutral on SM12x; set 8192 to revert
+    # to the prior conservative threshold.
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS", "4096")
+    ),
+    # Pre-compile the D512-split sparse-MLA prefill Triton kernels at startup
+    # (one per 128-aligned combined_topk in [256, 1152]) so the first long
+    # prefill does not pay a first-use JIT compile that blocks the engine step.
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE", "1"))
+    ),
+    "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_PREFILL", "1"))
+    ),
+    # Experimental sparse MLA fallback controls.
+    # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
+    # is unavailable; set 0/1 to force-disable/force-enable the fallback.
+    "VLLM_TRITON_MLA_SPARSE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE") is None
+        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE", "0")))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE") is None
+        else bool(int(os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "0")))
+    ),
+    # Opt-in MLA DCP query replication: skip the decode query all-gather.
+    "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1516,9 +1603,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Skip cudagraph/DP padding tokens in the MoE path by forcing their expert
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
-    # treats topk_id == -1 as a skip sentinel; off by default because not all
-    # kernels support it yet.
-    "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "0"))),
+    # treats topk_id == -1 as a skip sentinel
+    "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
@@ -1808,6 +1894,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Add optional nvtx scopes for profiling, disable to avoid overheads
     "VLLM_NVTX_SCOPES_FOR_PROFILING": lambda: bool(
         int(os.getenv("VLLM_NVTX_SCOPES_FOR_PROFILING", "0"))
+    ),
+    # DSpark branch-local CUDA graph controls. Stable DSpark fast-path kernels
+    # default on through SpeculativeConfig and are not environment-gated.
+    "VLLM_DSPARK_FORWARD_CUDAGRAPH": lambda: env_bool(
+        "VLLM_DSPARK_FORWARD_CUDAGRAPH"
+    ),
+    "VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP": lambda: env_bool(
+        "VLLM_DSPARK_FORWARD_CUDAGRAPH_ALLOW_TP"
     ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.
@@ -2112,6 +2206,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # Location-only derived paths: where a cache/config directory lives
+        # cannot affect compiled artifacts, and hashing them means relocating
+        # HOME or the XDG roots silently invalidates every compile cache
+        # (VLLM_CACHE_ROOT above and VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR below
+        # are already ignored for the same reason).
+        "VLLM_XLA_CACHE_PATH",
+        "VLLM_CONFIG_ROOT",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",

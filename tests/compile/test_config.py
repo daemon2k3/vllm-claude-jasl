@@ -83,9 +83,33 @@ def test_copy_pass():
 def test_custom_op():
     # proper syntax
     _ = CompilationConfig(custom_ops=["+quant_fp8", "-silu_and_mul"])
+    _ = CompilationConfig(custom_ops=["none", "+rms_norm"])
+    _ = CompilationConfig(custom_ops=["+rms_norm", "+rms_norm"])
 
-    with pytest.raises(ValueError, match="Invalid syntax '"):
-        _ = CompilationConfig(custom_ops=["quant_fp8"])
+    for custom_ops in (["quant_fp8"], ["+"], ["-"]):
+        with pytest.raises(ValueError, match="Invalid syntax '"):
+            CompilationConfig(custom_ops=custom_ops)
+
+
+@pytest.mark.parametrize(
+    ("custom_ops", "config_kwargs", "match"),
+    [
+        (["all", "none"], {}, "can contain only one base mode"),
+        (
+            ["none", "+rms_norm", "-rms_norm"],
+            {},
+            "cannot both enable and disable.*rms_norm",
+        ),
+        (
+            ["-rotary_embedding"],
+            {"pass_config": PassConfig(enable_qk_norm_rope_fusion=True)},
+            "cannot both enable and disable.*rotary_embedding",
+        ),
+    ],
+)
+def test_reject_contradictory_custom_ops(custom_ops, config_kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        CompilationConfig(custom_ops=custom_ops, **config_kwargs)
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
@@ -466,6 +490,38 @@ def test_cudagraph_sizes_post_init(
             vllm_config.compilation_config.max_cudagraph_capture_size
             == expected_max_size
         )
+
+
+def test_spec_decode_cudagraph_sizes_keep_small_full_decode_batches_exact():
+    config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=[
+            1,
+            2,
+            4,
+            8,
+            16,
+            24,
+            32,
+            40,
+            48,
+            56,
+            64,
+            72,
+            80,
+            88,
+            96,
+        ],
+        max_cudagraph_capture_size=96,
+    )
+
+    config.adjust_cudagraph_sizes_for_spec_decode(
+        uniform_decode_query_len=3,
+        tensor_parallel_size=1,
+    )
+
+    for num_reqs in range(1, 33):
+        assert 3 * num_reqs in config.cudagraph_capture_sizes
 
 
 @pytest.mark.skipif(

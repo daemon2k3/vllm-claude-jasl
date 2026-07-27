@@ -21,6 +21,8 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.kv_offload.compact_geometry import CompactTransportSignature
+    from vllm.v1.kv_offload.config import CompactGroupSliceConfig
 
 logger = init_logger(__name__)
 
@@ -968,10 +970,46 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
 
+    # Compact aggregate signature: transported by the scheduler through
+    # get_kv_cache_configs to every worker.  Populated before per-worker
+    # projection when enable_compact_layout is true.  None for legacy configs.
+    # Tuple order matches kv_cache_groups order.
+    compact_aggregate_signature: tuple[CompactTransportSignature, ...] | None = None
+
+    # Worker-local physical packed slice geometry. Populated on rich worker
+    # configs before scheduler projection and explicitly cleared from the
+    # collapsed scheduler copy. None for legacy and scheduler configs.
+    compact_slice_accounting: tuple[CompactGroupSliceConfig, ...] | None = None
+
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
 
     @property
+    def has_mixed_precision_kv_cache(self) -> bool:
+        """Whether attention groups store their KV cache at more than one precision."""
+        kv_cache_precisions: set[tuple[torch.dtype, KVQuantMode]] = set()
+        for group in self.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            group_specs = (
+                list(group_spec.kv_cache_specs.values())
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else [group_spec]
+            )
+            kv_cache_precisions.update(
+                (spec.dtype, spec.kv_quant_mode)
+                for spec in group_specs
+                if isinstance(spec, AttentionSpec)
+            )
+        return len(kv_cache_precisions) > 1
+
+    @property
     def needs_kv_cache_zeroing(self) -> bool:
-        return self.has_mamba_layers
+        """Whether newly allocated KV cache blocks must be zeroed before use.
+
+        Required for Mamba layers, whose state is read before it is fully written
+        (#35219), and for mixed-precision caches, where a block reused across
+        groups can be reinterpreted under a different precision and decode stale
+        bytes to NaN/Inf. Uniform-precision caches skip zeroing.
+        """
+        return self.has_mamba_layers or self.has_mixed_precision_kv_cache

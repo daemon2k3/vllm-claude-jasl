@@ -32,13 +32,14 @@ from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .diffusion import DiffusionConfig
+from .ec_manager_config import EncoderCacheManagerConfig
 from .ec_transfer import ECTransferConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
-from .mamba import MambaConfig
+from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
@@ -76,6 +77,15 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 
+_BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES = frozenset(
+    {
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
 
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
@@ -102,6 +112,24 @@ IS_DENSE = False
 #     IS_QUANTIZED = lambda c: c.model_config.is_quantized()
 #     IS_DENSE = lambda c: not c.model_config.is_model_moe()
 # See https://github.com/vllm-project/vllm/issues/25689.
+
+
+def _should_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig,
+) -> bool:
+    # Auto-enable breakable cudagraph only for architectures that lack
+    # @support_torch_compile and are known-good under it (MiniMax M3 and Inkling
+    # retain their upstream auto-enable). DeepSeek-V4 is deliberately excluded:
+    # breakable mode disables the torch.compile pipeline (equivalent to
+    # -cc.mode=none) and runs attention eagerly every decode step, which on SM12x
+    # is 1.5-3.8x SLOWER for MTP decode and degrades with output length (measured
+    # on RTX PRO 6000 / SM120 and 2x GB10 / SM121). FULL_AND_PIECEWISE +
+    # torch.compile is correct (GSM8K parity, bare-prompt clean) and faster, so
+    # it is the DSv4 default. Opt in with VLLM_USE_BREAKABLE_CUDAGRAPH=1.
+    return any(
+        arch in _BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES
+        for arch in model_config.architectures
+    )
 
 
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
@@ -187,10 +215,10 @@ def enable_norm_pad_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
-    """Enable MLA dual RMS norm fusion when AITer has fused_qk_rmsnorm."""
-    from vllm._aiter_ops import check_aiter_fused_qk_rmsnorm, rocm_aiter_ops
+    """Enable MLA dual RMS norm fusion on ROCm with AITER."""
+    from vllm._aiter_ops import rocm_aiter_ops
 
-    return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
+    return rocm_aiter_ops.is_enabled()
 
 
 def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
@@ -367,6 +395,10 @@ class VllmConfig:
     """The configurations for event publishing."""
     ec_transfer_config: ECTransferConfig | None = None
     """The configurations for distributed EC cache transfer."""
+    ec_manager_config: EncoderCacheManagerConfig = Field(
+        default_factory=EncoderCacheManagerConfig
+    )
+    """The configurations for custom encoder cache manager."""
     reasoning_config: ReasoningConfig | None = None
     """The configurations for reasoning model."""
     # some opaque config, only used to provide additional information
@@ -552,15 +584,12 @@ class VllmConfig:
         if use_v2_model_runner is not None:
             return use_v2_model_runner
 
-        # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
-        # is not otherwise a default-V2 architecture, so force V2 for it. If V2
-        # is unsupported for the rest of the config, _validate_v2_model_runner
-        # raises rather than silently falling back to V1 (which can't run dspark).
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.method == "dspark"
-        ):
-            return True
+        # DSpark runs on BOTH the V1 and V2 GPU model runners. On our SM12x
+        # DeepSeek-V4 stack the V1 runner has correct long-context recall while
+        # V2 does not (V2 collapses under concurrency at long context), so DSpark
+        # is NOT force-routed to V2: it follows the normal runner selection (V1
+        # by default, since DeepSeek-V4 is not a default-V2 architecture). Opt
+        # into the V2 DSpark speculator explicitly with VLLM_USE_V2_MODEL_RUNNER=1.
 
         # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only);
         # force V2 as for dspark, since a hybrid target otherwise defaults to V1.
@@ -1174,24 +1203,15 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile —
-        # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
-        # it unless the user has explicitly opted out via the env var.
+        # Some model classes don't carry @support_torch_compile and rely on the
+        # breakable cudagraph PIECEWISE path; auto-enable it for those unless the
+        # user explicitly opted out. DeepSeek-V4 is deliberately excluded (see
+        # _should_auto_enable_breakable_cudagraph) — it is faster on
+        # FULL_AND_PIECEWISE + torch.compile.
         if (
             self.model_config is not None
             and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "InklingForCausalLM",
-                    "InklingForConditionalGeneration",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
-            )
+            and _should_auto_enable_breakable_cudagraph(self.model_config)
         ):
             os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
             logger.info_once(
@@ -2300,6 +2320,37 @@ class VllmConfig:
         if mamba_block_size_is_set and not self.cache_config.enable_prefix_caching:
             raise ValueError(
                 "--mamba-block-size can only be set with --enable-prefix-caching"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_mamba_cached_kernel(self) -> "VllmConfig":
+        if not self.cache_config.use_replayssm:
+            return self
+        # ReplaySSM adds a 3-tensor ring to the mamba state; only models that
+        # opt in (supports_replayssm) build a consistent shape on both the layer
+        # and config paths. Reject others so the mamba page size cannot desync.
+        if self.model_config is not None and not self.model_config.supports_replayssm:
+            raise ValueError(
+                "--use-replayssm is only supported for Nemotron-H models "
+                f"(got architecture {self.model_config.architecture!r})"
+            )
+        if self.cache_config.mamba_cache_mode == "all":
+            raise ValueError(
+                "--use-replayssm supports prefix caching only in align mode; "
+                "pass --mamba-cache-mode align"
+            )
+        if self.num_speculative_tokens > 0:
+            raise ValueError("--use-replayssm does not support speculative decoding")
+        if self.mamba_config.backend != MambaBackendEnum.TRITON:
+            raise ValueError("--use-replayssm requires --mamba-backend triton")
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            raise ValueError(
+                "--use-replayssm is incompatible with KV connectors "
+                "(P/D disaggregation, KV cache offload)"
             )
         return self
 

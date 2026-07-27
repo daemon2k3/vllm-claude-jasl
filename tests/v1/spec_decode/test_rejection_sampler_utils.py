@@ -6,6 +6,7 @@ import math
 import pytest
 import torch
 
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -127,6 +128,91 @@ def _assert_distribution_match(
         f"df={df}, threshold={threshold:.1f}. "
         f"Output distribution does not match target distribution."
     )
+
+
+def test_gumbel_sample_stores_processed_logits_inplace():
+    logits = torch.tensor(
+        [[2.0, 4.0, 6.0], [3.0, 6.0, 9.0], [5.0, 10.0, 15.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    original = logits.clone()
+    idx_mapping = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+    temperature = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float32, device="cuda")
+    seeds = torch.tensor([123, 456, 789], dtype=torch.int64, device="cuda")
+    pos = torch.tensor([10, 11, 12], dtype=torch.int32, device="cuda")
+
+    gumbel_sample(
+        logits,
+        idx_mapping,
+        temperature,
+        seeds,
+        pos,
+        apply_temperature=True,
+        output_processed_logits_inplace=True,
+    )
+
+    expected = original.clone()
+    expected[2] /= 2.0
+    torch.testing.assert_close(logits, expected)
+
+
+def test_dense_draft_logits_index_mapping_matches_state_indexed():
+    torch.manual_seed(0)
+    device = "cuda"
+    num_speculative_steps = 3
+    num_trials = 128
+    target_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+    draft_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=1.0,
+        num_trials=num_trials,
+    )
+
+    state_ids = torch.randperm(num_trials, device=device).to(torch.int32)
+    dense_rows = torch.arange(num_trials, dtype=torch.int32, device=device)
+    seed = torch.empty_like(inputs["seed"])
+    seed[state_ids.long()] = inputs["seed"]
+
+    state_indexed_draft_logits = torch.empty_like(inputs["draft_logits"])
+    state_indexed_draft_logits[state_ids.long()] = inputs["draft_logits"]
+    state_indexed_inputs = dict(inputs)
+    state_indexed_inputs["idx_mapping"] = state_ids
+    state_indexed_inputs["expanded_idx_mapping"] = state_ids.repeat_interleave(
+        num_speculative_steps + 1
+    )
+    state_indexed_inputs["seed"] = seed
+    state_indexed_inputs["draft_logits"] = state_indexed_draft_logits
+
+    dense_index_mapping = torch.empty(
+        num_trials,
+        dtype=torch.int32,
+        device=device,
+    )
+    dense_index_mapping[state_ids.long()] = dense_rows
+    dense_inputs = dict(state_indexed_inputs)
+    dense_inputs["draft_logits"] = inputs["draft_logits"]
+
+    state_sampled, state_num_sampled = rejection_sample(
+        **state_indexed_inputs,
+        num_speculative_steps=num_speculative_steps,
+    )
+    dense_sampled, dense_num_sampled = rejection_sample(
+        **dense_inputs,
+        num_speculative_steps=num_speculative_steps,
+        draft_logits_index_mapping=dense_index_mapping,
+    )
+
+    torch.testing.assert_close(dense_num_sampled, state_num_sampled)
+    for req_idx in range(num_trials):
+        n = state_num_sampled[req_idx].item()
+        torch.testing.assert_close(
+            dense_sampled[req_idx, :n],
+            state_sampled[req_idx, :n],
+        )
 
 
 @pytest.mark.parametrize(
@@ -412,3 +498,65 @@ def test_block_verification_accepts_at_least_as_many(num_speculative_steps: int)
         f"Block verification mean accepted length {mean_block:.4f} is worse "
         f"than standard {mean_standard:.4f}."
     )
+
+
+@pytest.mark.parametrize("has_draft_logits", [True, False])
+def test_chunked_requests_match_full_batch(has_draft_logits: bool):
+    torch.manual_seed(7)
+    device = "cuda"
+    num_reqs = 5
+    num_speculative_steps = 3
+    vocab_size = 257
+
+    target_logits = torch.randn(vocab_size, device=device)
+    draft_logits = torch.randn(vocab_size, device=device)
+    inputs = _build_rejection_sample_inputs(
+        target_logits,
+        draft_logits,
+        num_speculative_steps,
+        temperature=0.6,
+        num_trials=num_reqs,
+    )
+    padded_target_logits = torch.empty(
+        inputs["target_logits"].shape[0], vocab_size + 3, device=device
+    )
+    padded_target_logits[:, :vocab_size].copy_(inputs["target_logits"])
+    inputs["target_logits"] = padded_target_logits[:, :vocab_size]
+    assert inputs["target_logits"].stride(-1) == 1
+    assert not inputs["target_logits"].is_contiguous()
+    if not has_draft_logits:
+        inputs["draft_logits"] = None
+
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=num_speculative_steps
+    )
+
+    sampled_chunks = []
+    num_sampled_chunks = []
+    for start, end in ((0, 2), (2, 5)):
+        lo = start * (num_speculative_steps + 1)
+        hi = end * (num_speculative_steps + 1)
+        chunk_inputs = dict(inputs)
+        for name in (
+            "target_logits",
+            "draft_sampled",
+            "pos",
+            "expanded_idx_mapping",
+            "expanded_local_pos",
+        ):
+            chunk_inputs[name] = inputs[name][lo:hi]
+        chunk_inputs["cu_num_logits"] = inputs["cu_num_logits"][start : end + 1] - lo
+        chunk_inputs["idx_mapping"] = inputs["idx_mapping"][start:end]
+
+        chunk_sampled, chunk_num_sampled = rejection_sample(
+            **chunk_inputs, num_speculative_steps=num_speculative_steps
+        )
+        sampled_chunks.append(chunk_sampled)
+        num_sampled_chunks.append(chunk_num_sampled)
+
+    chunked_sampled = torch.cat(sampled_chunks)
+    chunked_num_sampled = torch.cat(num_sampled_chunks)
+    assert torch.equal(chunked_num_sampled, num_sampled)
+    steps = torch.arange(num_speculative_steps + 1, device=device)
+    valid = steps.unsqueeze(0) < num_sampled.unsqueeze(1)
+    assert torch.equal(chunked_sampled[valid], sampled[valid])

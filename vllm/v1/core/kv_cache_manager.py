@@ -9,7 +9,10 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    HybridKVCacheCoordinator,
+    get_kv_cache_coordinator,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
@@ -125,6 +128,7 @@ class KVCacheManager:
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        max_num_seqs: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
     ) -> None:
@@ -156,6 +160,7 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            max_num_seqs=max_num_seqs,
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
@@ -183,6 +188,10 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        # Off-table cow blocks handed to a KV connector for partial-tail
+        # offload; pinned until the request's blocks are freed.
+        self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -203,6 +212,21 @@ class KVCacheManager:
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
+
+    def prefix_cache_lookup_enabled(self, request: Request) -> bool:
+        """Whether a local prefix cache lookup may be run for this request."""
+        return self.enable_caching and not request.skip_reading_prefix_cache
+
+    def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
+        # Don't count a request that skipped the cache lookup.
+        if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
+            return
+        assert self.prefix_cache_stats is not None
+        self.prefix_cache_stats.record(
+            num_tokens=request.num_tokens,
+            num_hits=num_hits,
+            preempted=request.num_preemptions > 0,
+        )
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
@@ -225,7 +249,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -269,16 +293,55 @@ class KVCacheManager:
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
 
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.record(
-                num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens,
-                preempted=request.num_preemptions > 0,
-            )
-
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
+
+    def get_computed_blocks_for_connector(
+        self, request: Request
+    ) -> tuple[KVCacheBlocks, int, int, bool]:
+        """Local prefix-cache lookup for a request scheduled with a KV connector.
+
+        Hybrid (Mamba + full-attention) models can have per-group prefix hits
+        diverge under block pressure: the full-attention tail may be evicted
+        while a deeper Mamba state survives, or vice versa. Report the
+        full-attention hit as the local prefix - the connector transfers the
+        remaining suffix and the Mamba state is transferred unconditionally by
+        nixl's ``_apply_prefix_caching`` - and flag when that hit ran deeper
+        than a lagging group. Such a hit only has a valid Mamba state at its
+        boundary if the connector supplies it, so the caller must fall back to
+        ``get_computed_blocks`` to reconcile when no external tokens are found.
+
+        Non-hybrid models and already-convergent hits use ``get_computed_blocks``.
+
+        Returns:
+            The ``get_computed_blocks`` triple (blocks, number of local computed
+            tokens, shared-prefix boundary) plus ``hit_diverged``.
+        """
+        coordinator = self.coordinator
+        if not (
+            self.kv_cache_config.has_mamba_layers
+            and isinstance(coordinator, HybridKVCacheCoordinator)
+            and coordinator.full_attention_group_id is not None
+        ):
+            return *self.get_computed_blocks(request), False
+
+        if not self.prefix_cache_lookup_enabled(request):
+            return self.empty_kv_cache_blocks, 0, 0, False
+
+        fa_group_id = coordinator.full_attention_group_id
+        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes, request.num_tokens - 1
+        )
+        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+            # A lagging group hit deeper than full attention means its
+            # full-attention blocks were evicted; use the reconciled boundary
+            # that every group agrees on.
+            return *self.get_computed_blocks(request), False
+
+        num_local = per_group_hits[fa_group_id]
+        blocks = self.create_kv_cache_blocks(computed)
+        # Per-group lookups do not detect an uncached shared prefix (boundary 0).
+        return blocks, num_local, 0, min(per_group_hits) < num_local
 
     def allocate_slots(
         self,
@@ -398,6 +461,9 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        block_ids_to_skip_releasing = self._block_ids_to_skip_releasing(
+            new_computed_block_list
+        )
 
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
@@ -422,8 +488,11 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if not self._has_enough_free_blocks(
+                num_blocks_to_allocate,
+                block_ids_to_skip_releasing,
+                watermark_blocks=watermark_blocks,
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -457,11 +526,12 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        # Keep `reserved_blocks` free for other in-flight sequences, and an
-        # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        if not self._has_enough_free_blocks(
+            num_blocks_to_allocate,
+            block_ids_to_skip_releasing,
+            reserved_blocks=reserved_blocks,
+            watermark_blocks=watermark_blocks,
+        ):
             # Cannot allocate new blocks
             return None
 
@@ -511,6 +581,9 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        pins = self._partial_tail_pins.pop(request.request_id, None)
+        if pins:
+            self.block_pool.free_blocks(pins)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -543,7 +616,14 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
-        return self.coordinator.pop_blocks_for_free(request.request_id)
+        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+        # Pins ride the same (possibly deferred) free as the request blocks.
+        # Preemption may release a pin under a still-queued offload — the same
+        # exposure normal saves of table blocks already have.
+        pins = self._partial_tail_pins.pop(request.request_id, None)
+        if pins:
+            blocks = pins + blocks
+        return blocks
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -552,6 +632,32 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
         """
         self.block_pool.evict_blocks(block_ids)
+
+    @staticmethod
+    def _block_ids_to_skip_releasing(
+        blocks: tuple[Sequence[KVCacheBlock], ...],
+    ) -> set[int]:
+        return {
+            block.block_id
+            for group_blocks in blocks
+            for block in group_blocks
+            if not block.is_null
+        }
+
+    def _has_enough_free_blocks(
+        self,
+        num_blocks: int,
+        block_ids_to_skip_releasing: set[int] | None = None,
+        reserved_blocks: int = 0,
+        watermark_blocks: int = 0,
+    ) -> bool:
+        required_free_blocks = num_blocks + reserved_blocks + watermark_blocks
+        if required_free_blocks <= self.block_pool.get_num_free_blocks():
+            return True
+        self.coordinator.release_protected_prompt_blocks(
+            required_free_blocks, block_ids_to_skip_releasing
+        )
+        return required_free_blocks <= self.block_pool.get_num_free_blocks()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -562,6 +668,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        self.coordinator.release_protected_prompt_blocks()
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -703,6 +810,25 @@ class KVCacheManager:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
 
+    def truncate_computed_blocks(
+        self, blocks: KVCacheBlocks, num_computed_tokens: int
+    ) -> KVCacheBlocks:
+        """Return a lookup-result view truncated at an aligned token endpoint.
+
+        Pure slicing: refcounts are untouched and ``blocks`` is not mutated.
+        """
+        truncated: list[list[KVCacheBlock]] = []
+        for group_blocks, manager in zip(
+            blocks.blocks,
+            self.coordinator.single_type_managers,
+            strict=True,
+        ):
+            assert num_computed_tokens % manager.block_size == 0
+            num_blocks = num_computed_tokens // manager.block_size
+            assert num_blocks <= len(group_blocks)
+            truncated.append(list(group_blocks[:num_blocks]))
+        return self.create_kv_cache_blocks(tuple(truncated))
+
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
         ids: list[int] = []
@@ -754,6 +880,34 @@ class KVCacheManager:
         ]
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
+
+    def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain producer partial-tail offload hand-offs per request.
+
+        Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
+        for the durable boundary blocks of producers' last-prompt-boundary
+        partial tails. Only mamba "align" groups contribute; empty otherwise.
+        A KV connector reads the referenced blocks and offloads them so a later
+        request can hit the sub-block prefix.
+
+        Each handed-off block lives off the request block table, so it is
+        pinned here and unpinned when the request's blocks are freed — for a
+        producer with saved tokens, after the connector reports sends done.
+        """
+        offloads: dict[str, list[tuple[int, int, int]]] = {}
+        for mgr in self.coordinator.single_type_managers:
+            for (
+                req_id,
+                group_id,
+                block,
+                boundary_tokens,
+            ) in mgr.take_pending_partial_tail_offloads():
+                self.block_pool.touch((block,))
+                self._partial_tail_pins.setdefault(req_id, []).append(block)
+                offloads.setdefault(req_id, []).append(
+                    (group_id, block.block_id, boundary_tokens)
+                )
+        return offloads
 
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""

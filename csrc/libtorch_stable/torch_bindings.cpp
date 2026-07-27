@@ -429,9 +429,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 
   ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
-      "Tensor q_in, Tensor kv, Tensor! k_cache, "
+      "Tensor q_in, Tensor kv, Tensor! q_out, Tensor! k_cache, "
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "int q_head_padded, float eps, int cache_block_size) -> Tensor");
+      "float eps, int cache_block_size) -> ()");
 
   // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
   // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
@@ -782,10 +782,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "            int block_size_in_bytes, Tensor block_mapping) -> ()");
 
   // Batch swap: submit all block copies in a single driver call.
+  // When use_batch_api is false, skip cuMemcpyBatchAsync/hipMemcpyBatchAsync
+  // and use per-descriptor cudaMemcpyAsync fallback.
   ops.def(
       "swap_blocks_batch(Tensor src_ptrs, Tensor dst_ptrs,"
       "                  Tensor sizes,"
-      "                  bool is_src_access_order_any=False) -> ()");
+      "                  bool is_src_access_order_any=False,"
+      "                  bool use_batch_api=True) -> ()");
 
   // Reshape the key and value tensors and cache them.
   ops.def(
