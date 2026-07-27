@@ -38,6 +38,24 @@ MODULE_ATTRS = {
     "ScoringRequestOutput": ".outputs:ScoringRequestOutput",
 }
 
+# Eager imports for commonly used modules to avoid circular import via __getattr__
+import vllm.envs
+from vllm.sampling_params import SamplingParams
+from vllm.pooling_params import PoolingParams
+from vllm.inputs import PromptType, TextPrompt, TokensPrompt
+from vllm.outputs import (
+    ClassificationOutput,
+    ClassificationRequestOutput,
+    CompletionOutput,
+    EmbeddingOutput,
+    EmbeddingRequestOutput,
+    PoolingOutput,
+    PoolingRequestOutput,
+    RequestOutput,
+    ScoringOutput,
+    ScoringRequestOutput,
+)
+
 if typing.TYPE_CHECKING:
     from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
     from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -60,6 +78,7 @@ if typing.TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.executor.ray_utils import initialize_ray_cluster
+
 else:
 
     def __getattr__(name: str) -> typing.Any:
