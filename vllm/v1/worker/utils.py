@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -399,7 +400,9 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
         init_snapshot.total_memory * cache_config.gpu_memory_utilization
     )
 
-    if init_snapshot.free_memory < requested_memory:
+    if os.getenv("VLLM_SKIP_INIT_MEMORY_CHECK") == "1":
+        pass
+    elif init_snapshot.free_memory < requested_memory:
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"
