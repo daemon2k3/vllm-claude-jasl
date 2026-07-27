@@ -65,14 +65,12 @@ void cutlass_moe_mm_sm100(torch::stable::Tensor& out_tensors,
                           bool per_act_token, bool per_out_ch);
 #endif
 
-#if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
 void cutlass_scaled_mm_sm120(torch::stable::Tensor& c,
                              torch::stable::Tensor const& a,
                              torch::stable::Tensor const& b,
                              torch::stable::Tensor const& a_scales,
                              torch::stable::Tensor const& b_scales,
                              std::optional<torch::stable::Tensor> const& bias);
-#endif
 
 #if defined ENABLE_SCALED_MM_SM100 && ENABLE_SCALED_MM_SM100
 void cutlass_scaled_mm_sm100(torch::stable::Tensor& c,
@@ -219,12 +217,10 @@ void cutlass_scaled_mm(torch::stable::Tensor& c, torch::stable::Tensor const& a,
       a.get_device_index());
   int32_t version_num = get_sm_version_num();
 
-#if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
   if (version_num >= 120) {
     cutlass_scaled_mm_sm120(c, a, b, a_scales, b_scales, bias);
     return;
   }
-#endif
 
 #if defined ENABLE_SCALED_MM_SM100 && ENABLE_SCALED_MM_SM100
   if (version_num >= 100 && version_num < 120) {
