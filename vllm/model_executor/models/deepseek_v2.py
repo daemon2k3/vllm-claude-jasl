@@ -686,7 +686,7 @@ class Indexer(nn.Module):
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
 
-        self.scale_fmt = "ue8m0"
+        self.scale_fmt = "ue8m0" if __import__("vllm.utils.deep_gemm", fromlist=["is_deep_gemm_supported"]).is_deep_gemm_supported() else None
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
