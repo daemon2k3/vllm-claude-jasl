@@ -3,7 +3,7 @@
 
 import copy
 import os
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Callable, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
